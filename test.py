@@ -1,55 +1,77 @@
 import pandas as pd
 import numpy as np
+import glob
+import os
 
-def analyze_opponent_freezes(csv_path, s_col='opp_s', d_col='opp_d', ego_s_col='ego_s', min_consecutive_rows=5):
-    """
-    Scans a telemetry CSV for segments where the opponent's s and d are frozen
-    while the ego vehicle is actively moving.
-    """
-    print(f"Analyzing {csv_path}...")
+def analyze_perception_vs_throttling(csv_path, eps=1e-5, lidar_range_threshold=10.0):
+    print("=" * 70)
+    print(f"ANALYSIS REPORT: {os.path.basename(csv_path)}")
+    print("=" * 70)
     
-    # Read only the required columns to save memory
-    cols = [s_col, d_col, ego_s_col]
-    df = pd.read_csv(csv_path, usecols=lambda c: c in cols)
-    
-    # Calculate step-to-step deltas
-    opp_s_diff = df[s_col].diff().fillna(0)
-    opp_d_diff = df[d_col].diff().fillna(0)
-    ego_s_diff = df[ego_s_col].diff().fillna(0)
-    
-    # Detect exact freezes (opp static, ego moving)
-    # Using a tight epsilon for floating-point safety
-    eps = 1e-6
-    is_opp_frozen = (opp_s_diff.abs() < eps) & (opp_d_diff.abs() < eps)
-    is_ego_moving = ego_s_diff.abs() > eps
-    
-    freeze_mask = is_opp_frozen & is_ego_moving
-    
-    # Group consecutive frozen frames
-    freeze_groups = (~freeze_mask).cumsum()[freeze_mask]
-    group_counts = freeze_groups.value_counts()
-    
-    # Filter by minimum duration/rows
-    significant_freezes = group_counts[group_counts >= min_consecutive_rows]
-    
+    df = pd.read_csv(csv_path)
     total_rows = len(df)
-    total_frozen_rows = freeze_mask.sum()
-    pct_frozen = (total_frozen_rows / total_rows) * 100
     
-    print("\n--- Summary Statistics ---")
-    print(f"Total frames: {total_rows}")
-    print(f"Frozen opp frames (while ego moving): {total_frozen_rows} ({pct_frozen:.2f}%)")
-    print(f"Freeze streaks >= {min_consecutive_rows} consecutive frames: {len(significant_freezes)}")
+    # 1. Calculate Euclidean separation distance (Ego to Opp)
+    df['dist'] = np.hypot(df['opp_x'] - df['ego_x'], df['opp_y'] - df['ego_y'])
     
-    if not significant_freezes.empty:
-        print(f"Longest continuous freeze: {significant_freezes.max()} frames")
+    # 2. Movement & Frenet Update deltas
+    df['d_opp_s'] = df['opp_s'].diff().abs()
+    df['d_opp_d'] = df['opp_d'].diff().abs()
+    df['d_ego_s'] = df['ego_s'].diff().abs()
+    
+    ego_moving = df['d_ego_s'] > eps
+    
+    # Is Frenet actively updating vs frozen?
+    frenet_updating = (df['d_opp_s'] > eps) | (df['d_opp_d'] > eps)
+    frenet_frozen = (df['d_opp_s'] < eps) & (df['d_opp_d'] < eps) & ego_moving
+    
+    # 3. Test Cases
+    # Case A: Updating while OUTSIDE standard LiDAR range (> lidar_range_threshold)
+    updating_far = frenet_updating & (df['dist'] > lidar_range_threshold)
+    
+    # Case B: Frozen while INSIDE close LiDAR range (< 5.0m, dead-ahead/close)
+    frozen_close = frenet_frozen & (df['dist'] < 5.0)
+    
+    print("\n[1] Overall Distance vs Frenet State Summary:")
+    print(f"  - Total Frames: {total_rows}")
+    print(f"  - Min Distance: {df['dist'].min():.2f} m | Max Distance: {df['dist'].max():.2f} m | Median: {df['dist'].median():.2f} m")
+    
+    print("\n[2] Key Hypothesis Test Results:")
+    print(f"  A. Frames UPDATING at long range (dist > {lidar_range_threshold}m):")
+    print(f"     -> Count: {updating_far.sum()} frames (Max distance observed while updating: {df.loc[frenet_updating, 'dist'].max():.2f} m)")
+    
+    print(f"\n  B. Frames FROZEN at point-blank range (dist < 5.0m):")
+    print(f"     -> Count: {frozen_close.sum()} frames")
+    
+    # 4. Detailed Distance Bins Breakdown
+    bins = [0, 2, 5, 8, 12, 18, 25, 50, 100]
+    df['dist_bin'] = pd.cut(df['dist'], bins=bins)
+    
+    bin_summary = df[ego_moving].groupby('dist_bin', observed=False).agg(
+        total_frames=('dist', 'count'),
+        frenet_frozen_frames=('d_opp_s', lambda s: ((s < eps) & (df.loc[s.index, 'd_opp_d'] < eps)).sum()),
+        frenet_active_frames=('d_opp_s', lambda s: ((s > eps) | (df.loc[s.index, 'd_opp_d'] > eps)).sum())
+    )
+    bin_summary['pct_frozen'] = (bin_summary['frenet_frozen_frames'] / bin_summary['total_frames']) * 100
+    
+    print("\n[3] Distance Bins vs Freeze Rates (while Ego is moving):")
+    print(f"  {'Distance Range (m)':<20} | {'Total':<8} | {'Active (s,d)':<14} | {'Frozen (s,d)':<14} | {'% Frozen'}")
+    print("  " + "-" * 72)
+    for idx, row in bin_summary.iterrows():
+        print(f"  {str(idx):<20} | {int(row['total_frames']):<8} | {int(row['frenet_active_frames']):<14} | {int(row['frenet_frozen_frames']):<14} | {row['pct_frozen']:.1f}%")
         
-    return {
-        "total_rows": total_rows,
-        "frozen_rows": total_frozen_rows,
-        "pct_frozen": pct_frozen,
-        "streak_counts": significant_freezes
-    }
+    # 5. Consecutive streak inspection at point-blank range (if any)
+    if frozen_close.sum() > 0:
+        print("\n[4] Sample of Point-Blank Freezes (< 5.0m):")
+        sample_rows = df[frozen_close].head(5)[['timestamp', 'ego_s', 'opp_s', 'opp_x', 'opp_y', 'dist']]
+        print(sample_rows.to_string())
 
-# Run the analysis
-analyze_opponent_freezes("data/richard_existing.csv")
+    print("\n" + "=" * 70 + "\n")
+
+if __name__ == "__main__":
+    csv_files = glob.glob("data/*.csv")
+    if not csv_files:
+        print("No CSV files found.")
+    else:
+        for f in csv_files:
+            analyze_perception_vs_throttling(f)
